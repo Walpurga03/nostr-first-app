@@ -1,14 +1,133 @@
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/nostr-first-app/vite.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Vite + React</title>
-    <script type="module" crossorigin src="/nostr-first-app/assets/index-BZwPoZ5k.js"></script>
-    <link rel="stylesheet" crossorigin href="/nostr-first-app/assets/index-DiwrgTda.css">
-  </head>
-  <body>
-    <div id="root"></div>
-  </body>
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <!-- Laden der notwendigen Bibliotheken -->
+    <script src="https://bundle.run/noble-secp256k1@1.2.14"></script>
+    <script src="https://bundle.run/browserify-cipher@1.0.1"></script>
+</head>
+<body>
+    <script>
+        // Hilfsfunktionen zum Konvertieren zwischen Hexadezimal- und Byte-Arrays
+        var hexToBytes = hex => Uint8Array.from( hex.match( /.{1,2}/g ).map( byte => parseInt( byte, 16 ) ) );
+        var bytesToHex = bytes => bytes.reduce( ( str, byte ) => str + byte.toString( 16 ).padStart( 2, "0" ), "" );
+
+        // Importieren von Funktionen aus der noble-secp256k1 Bibliothek
+        var { getSharedSecret, schnorr, utils } = nobleSecp256k1;
+        var sha256  = nobleSecp256k1.utils.sha256;
+
+        // Generieren eines privaten Schlüssels und eines öffentlichen Schlüssels
+        var privKey = bytesToHex( nobleSecp256k1.utils.randomPrivateKey() );
+        var pubKey  = nobleSecp256k1.getPublicKey(privKey, true);
+        pubKey      = pubKey.substring( 2 );
+        console.log( pubKey );
+
+        // Verbinden mit dem Relay-Server
+        var relay = "wss://relay.damus.io";
+        var socket = new WebSocket( relay );
+
+        // Event-Listener für eingehende Nachrichten
+        socket.addEventListener('message', async function( message ) {
+            var [ type, subId, event ] = JSON.parse( message.data );
+            var { kind, content } = event || {}
+            if (!event || event === true) return;
+            console.log('message:', event);
+            
+            // Entschlüsseln der Nachricht, falls der Nachrichtentyp 4 ist (verschlüsselte Nachricht)
+            if (kind === 4) {
+                content = await decrypt(privKey, event.pubkey, content);
+            }
+            console.log('content:', content);
+        });
+
+        // Event-Listener für das Öffnen der Verbindung
+        socket.addEventListener('open', async function( e ) {
+            console.log( "connected to " + relay );
+
+            // Abonnieren von Nachrichten
+            var subId   = bytesToHex( nobleSecp256k1.utils.randomPrivateKey() ).substring( 0, 16 );
+            var filter  = { "authors": [ pubKey ] }
+            var subscription = [ "REQ", subId, filter ]
+            console.log('Subscription:', subscription);
+            socket.send(JSON.stringify( subscription ));
+
+            // Erstellen und Senden einer normalen Nachricht
+            var event = {
+                "content"    : "this workshop is awesome!",
+                "created_at" : Math.floor( Date.now() / 1000 ),
+                "kind"       : 1,
+                "tags"       : [],
+                "pubkey"     : pubKey,
+            }
+            var signedEvent = await getSignedEvent(event, privKey);
+            console.log('signedEvent:', signedEvent);
+            socket.send(JSON.stringify([ "EVENT", signedEvent ]));
+
+            // Erstellen und Senden einer verschlüsselten Nachricht
+            var message   = "this message is super secret!"
+            var encrypted = encrypt( privKey, pubKey, message )
+            var event2 = {
+                "content"	: encrypted,
+                "created_at" : Math.floor( Date.now() / 1000 ),
+                "kind"   	: 4,
+                "tags"   	: [ [ 'p', pubKey ] ],
+                "pubkey" 	: pubKey,
+            }
+            var signedEvent2 = await getSignedEvent(event2, privKey);
+            socket.send(JSON.stringify([ "EVENT", signedEvent2 ]));
+        });
+
+        // Funktion zum Signieren eines Events
+        async function getSignedEvent(event, privateKey) {
+            var eventData = JSON.stringify([
+                0,                    // Reserviert für zukünftige Verwendung
+                event['pubkey'],      // Öffentlicher Schlüssel des Senders
+                event['created_at'],  // Unix-Zeitstempel
+                event['kind'],        // Nachrichtentyp
+                event['tags'],        // Tags zur Identifikation von Antworten/Empfängern
+                event['content']      // Inhalt der Nachricht
+            ]);
+            event.id  = bytesToHex( await sha256( ( new TextEncoder().encode( eventData ) ) ) );
+            event.sig = await schnorr.sign( event.id, privateKey );
+            return event;
+        }
+
+        // Funktion zum Konvertieren von Base64 in Hexadezimal
+        function base64ToHex( str ) {
+            var raw = atob( str );
+            var result = '';
+            var i; for ( i=0; i<raw.length; i++ ) {
+                var hex = raw.charCodeAt( i ).toString( 16 );
+                result += ( hex.length === 2 ? hex : '0' + hex );
+            }
+            return result;
+        }
+
+        // Funktion zum Verschlüsseln einer Nachricht
+        function encrypt( privkey, pubkey, text ) {
+            var key = nobleSecp256k1.getSharedSecret( privkey, '02' + pubkey, true ).substring( 2 );
+            var iv = window.crypto.getRandomValues(new Uint8Array(16));
+            var cipher = browserifyCipher.createCipheriv( 'aes-256-cbc', hexToBytes( key ), iv );
+            var encryptedMessage = cipher.update(text,"utf8","base64");
+            emsg = encryptedMessage + cipher.final( "base64" );
+            var uint8View = new Uint8Array( iv.buffer );
+            var decoder = new TextDecoder();
+            return emsg + "?iv=" + btoa( String.fromCharCode.apply( null, uint8View ) );
+        }
+
+        // Funktion zum Entschlüsseln einer Nachricht
+        async function decrypt( privkey, pubkey, ciphertext ) {
+            var [ emsg, iv ] = ciphertext.split( "?iv=" );
+            var key = nobleSecp256k1.getSharedSecret( privkey, '02' + pubkey, true ).substring( 2 );
+            var decipher = browserifyCipher.createDecipheriv(
+                'aes-256-cbc',
+                hexToBytes( key ),
+                hexToBytes( base64ToHex( iv ) )
+            );
+            var decryptedMessage = decipher.update( emsg, "base64" );
+            dmsg = decryptedMessage + decipher.final( "utf8" );
+            return dmsg;
+        }
+    </script>
+</body>
 </html>
